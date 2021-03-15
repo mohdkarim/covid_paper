@@ -1,0 +1,493 @@
+---
+title: "GSMR_coloc_COVID_analysis_codes"
+author: "mak"
+date: "15/03/2021"
+output: html_document
+---
+
+GSMR (Generalised Summary data-based Mendelian randomisation) requires three types of data to run:
+
+1. Exposure data
+2. Outcome data
+3. Reference panel data
+
+The following GSMR parameters will be used to select genetic instruments:
+
+a) pan-MR
+
+1. p < 5 x 10-8
+2. r2 < 0.05
+3. Minimum number of cis-pQTLs = 10
+3. P-HEIDI flag = on
+
+b) cis-MR (codes for cis-extraction are provided in make_cis_dataset_sun.R)
+
+1. p < 1 x 10-5
+2. r2 < 0.05
+3. Minimum number of cis-pQTLs = 5
+3. P-HEIDI flag = on
+
+These three data types need to be in a standard COJO format:
+
+https://cnsgenomics.com/software/gcta/#GSMR
+
+Example:
+
+SNP A1  A2  freq    b   se  p   N
+rs1000000   G   A   0.781838245 1.00E-04    0.0044  0.9819  231410
+rs10000010  T   C   0.513760872 -0.0029 0.003   0.3374  322079
+rs10000012  G   C   0.137219265 -0.0095 0.0054  0.07853 233933
+rs10000013  A   C   0.775931455 -0.0095 0.0044  0.03084 233886
+
+# Exposure data: Sun et al
+
+1. Download harmonised Sun et al data to my google virtual machine (VM)
+2. Add a tab-separated column to each protein GWAS that includes the protein probe name (this will enable me to process each protein file in BigQuery (BQ))
+3. Upload all files to a google bucket (GB) (presently, unable to load files directly from VM to BQ)
+4. Load all files to BQ en-masse
+5. In BQ, because Sun et al data does not have allele frequency or N, I will use gnomad v2 NFE population to annotate allele frequencies and use a constant N (3300) for sample size for all variants. With these settings applied, I will generate comma-separate protein GWAS files (removing any duplicate rows) and send back to my GB. (this is all done in R using the bigrquery package)
+6. For protein GWAS files bigger than 1 GB, BQ splits the files, so will need to compose files back to GB
+7. Replace the commas with tab in each protein GWAS file (either by downloading composed files to VM or mounting the GB on VM)
+
+## Download harmonised Sun et al data to my google virtual machine (VM)
+
+```{bash eval=FALSE}
+# log in VM
+
+gcloud compute --project <PROJECT> ssh --zone <ZONE> <VM>
+
+mkdir harmonised
+
+cd harmonised
+
+wget --user=<> --password=<> ftp://ftp-private.ebi.ac.uk/upload/otar_gen/sun_harmonised_38.tar.gz
+
+tar -xvzf sun_harmonised_38.tar.gz
+
+```
+
+## Add a tab-separated column to each protein GWAS that includes the protein probe name (this will enable me to process each protein file in BigQuery (BQ))
+
+```{bash eval=FALSE}
+for f in `ls *.tsv`; 
+  do awk -v OFS='\t' 'NR==1 { print "probe", $0 } {print FILENAME (NF?"\t":"") $0}' "$f" > tmp && mv tmp "$f"; done
+```
+
+## Upload all files to a google bucket (GB) (presently, unable to load files directly from VM to BQ)
+
+```{bash eval=FALSE}
+gsutil cp harmonised/* gs://genetics-portal-analysis/mohd/SUN2018_full_harmonised
+```
+
+## Load all protein GWAS files to BQ en-masse (done manually from BQ console)
+
+## In BQ, because Sun et al data does not have allele frequency or N, I will use gnomad v2 NFE population to annotate allele frequencies and use a constant N (3300) for sample size for all variants. With these settings applied, I will generate comma-separate protein GWAS files (removing any duplicate rows) and send back to my GB. (this is all done in R using the bigrquery package)
+
+```{r eval=FALSE}
+library(bigrquery)
+library(dplyr)
+
+project <- "open-targets-genetics" # replace this with your project ID 
+
+# Create vector of Sun proteins from gcloud
+
+qry1 <- "SELECT string_field_0 FROM `mohd_hypothesis.SUN2018_full` GROUP BY string_field_0"
+
+study2 <- bq_project_query(project, qry1) %>% bq_table_download()
+
+sapply(seq_along(study2$string_field_0), function (x) {
+  
+  # build query
+  
+  require(bigrquery)
+  
+  project <- "open-targets-genetics"
+  
+  trait <- study2$string_field_0[x]
+  
+  trait2 <- gsub("\\.", "\\_", trait)
+  
+  print(trait2)
+  
+  # THIS QUERY WILL REMOVE ROWS WITH DUPLICATE SNP IDs
+  
+  qry <- paste0("WITH 
+  BIG_QUERY AS (
+ WITH
+  BIG_SUB_QUERY AS (
+  SELECT
+  CONCAT(string_field_3, ':', string_field_4, ':', string_field_5, ':', string_field_6) AS SNP,
+  string_field_6 AS A1,
+  string_field_5 AS A2,
+  g.af.gnomad_nfe AS freq,
+  string_field_7 AS b,
+  string_field_19 AS se,
+  string_field_21 AS p,
+  '3300' AS N
+FROM
+  `mohd_hypothesis.",trait2, "` m
+INNER JOIN
+  `200201.variants` g
+ON
+  CONCAT(m.string_field_3, ':', m.string_field_4, ':', m.string_field_5, ':', m.string_field_6) = CONCAT(g.chr_id, ':', g.position, ':', g.ref_allele, ':', g.alt_allele))
+SELECT
+  *
+FROM (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY SNP) row_number
+  FROM
+    BIG_SUB_QUERY)
+WHERE
+  row_number = 1)
+  SELECT
+    SNP,
+    A1,
+    A2,
+    freq,
+    b,
+    se,
+    p,
+    N
+   FROM
+    BIG_QUERY")
+
+  # run bigquery
+  
+  tb <- try(bq_project_query(project, qry))
+  
+  # save in my gcloud bucket
+  
+  try(bq_perform_extract(tb, paste0("gs://genetics-portal-analysis/mohd/SUN2018_full_harmonised_gsmr/", trait2, "*.csv"), destination_format = "CSV", print_header = FALSE))
+  
+  print(paste0(trait, " GSMR formatted and uploaded to GC bucket"))
+  
+})
+
+```
+
+## For protein GWAS files bigger than 1 GB, BQ splits the files, so will need to compose files back
+
+```{r eval=FALSE}
+library(bigrquery)
+library(dplyr)
+
+project <- "open-targets-genetics" # replace this with your project ID 
+
+# Create vector of Sun proteins from gcloud
+
+qry1 <- "SELECT string_field_0 FROM `mohd_hypothesis.SUN2018_full` GROUP BY string_field_0"
+
+study2 <- bq_project_query(project, qry1) %>% bq_table_download()
+
+trait <- gsub("\\.", "\\_", study2$string_field_0)
+
+listofoutcomes <- paste0(trait, "*.csv")
+
+write.table(listofoutcomes, "listofsungwas_tocompose.txt", row.names = FALSE, quote = FALSE, col.names = FALSE)
+
+system('/Users/mk31/google-cloud-sdk/bin/gcloud compute scp ~/gsmr-test/listofsungwas_tocompose.txt "mohd-analysis-gsmr3-uk10k": --zone=europe-west1-d')
+```
+
+```{bash eval=FALSE}
+for url in $(cat listofsungwas_tocompose.txt); do
+     wd=$(pwd)
+     prot=$(sed 's/\*//g' <<< "$url")
+     gsutil compose gs://genetics-portal-analysis/mohd/SUN2018_full_harmonised_gsmr/${url} gs://genetics-portal-analysis/mohd/SUN2018_full_harmonised_gsmr/${prot}
+ done
+```
+
+## Replace the commas with single space in each protein GWAS file (either by downloading composed files to VM or mounting the GB on VM)
+
+```{r eval=FALSE}
+# Download all partially gsmr formatted Sun files to VM
+
+library(bigrquery)
+library(dplyr)
+
+project <- "open-targets-genetics" # replace this with your project ID 
+
+# Create vector of Sun proteins from gcloud
+
+qry1 <- "SELECT string_field_0 FROM `mohd_hypothesis.SUN2018_full` GROUP BY string_field_0"
+
+study2 <- bq_project_query(project, qry1) %>% bq_table_download()
+
+trait <- gsub("\\.", "\\_", study2$string_field_0)
+
+listofoutcomes2 <- paste0("gs://genetics-portal-analysis/mohd/SUN2018_full_harmonised_gsmr/", trait, ".csv")
+
+write.table(listofoutcomes2, "listofoutcomes_to_replace_comma_with_space.txt", row.names = FALSE, quote = FALSE, col.names = FALSE)
+
+system('/Users/mk31/google-cloud-sdk/bin/gcloud compute scp ~/gsmr-test/listofoutcomes_to_replace_comma_with_space.txt "mohd-analysis-gsmr3-uk10k": --zone=europe-west1-d')
+
+
+```
+
+```{bash eval=FALSE}
+
+mkdir gsmr_formatted_harmonised_SUN2018
+
+mv listofoutcomes_to_replace_comma_with_space.txt gsmr_formatted_harmonised_SUN2018
+
+cd gsmr_formatted_harmonised_SUN2018
+
+cat listofoutcomes_to_replace_comma_with_space.txt | gsutil -m cp -I .
+
+# all files can downloaded to VM (as I have done) or mounted to VM (using gcsfuse), and then sed can be used to make in-file comma replacement with single space
+
+sed -i -e 's/,/ /g' dir/*.csv
+
+```
+
+
+# Outcome data: COVID
+
+1. Download harmonised COVID data (5 GWAS EUR-only datasets, leaving out 23andme, released on Oct 2020, release 4 > https://www.covid19hg.org/results/) to my google virtual machine (VM)
+2. Add N (case + control) sample size to each COVID GWAS file
+3. Upload to my GB
+5. Load each table in BQ from GB manually (specifying CSV format but), specifying 'tab' as a delimiter in advanced options as these are really tab-separated files
+6. Use BQ to gsmr-format each COVID gwas file, remove any duplicate rows, and send them back to my GB
+7. Compose files back if they are split by BQ
+8. Replace comma by single space
+
+## Download harmonised COVID data (5 GWAS EUR-only datasets, leaving out 23andme, released on Oct 2020, release 4 > https://www.covid19hg.org/results/) to my google virtual machine (VM)
+
+```{r eval=FALSE}
+# Compile list of links to dataset:
+
+# Very severe respiratory confirmed covid vs. not hospitalized covid # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_A1_ALL_20201020.txt.gz
+
+# Very severe respiratory confirmed covid vs. population # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_A2_ALL_leave_23andme_20201020.txt.gz
+
+# Hospitalized covid vs. not hospitalized covid # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_B1_ALL_20201020.txt.gz
+
+# Hospitalized covid vs. population # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_B2_ALL_leave_23andme_20201020.txt.gz
+
+# Covid vs. lab/self-reported negative # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_C1_ALL_leave_23andme_20201020.txt.gz
+
+# Covid vs. population # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_C2_ALL_leave_23andme_20201020.txt.gz
+
+# Predicted covid from self-reported symptoms vs. predicted or self-reported non-covid # https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_D1_ALL_20201020.txt.gz
+
+covidurls <- c("https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_A1_ALL_20201020.txt.gz", "https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_A2_ALL_leave_23andme_20201020.txt.gz", "https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_B1_ALL_20201020.txt.gz", "https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_B2_ALL_leave_23andme_20201020.txt.gz", "https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_C1_ALL_leave_23andme_20201020.txt.gz", "https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_C2_ALL_leave_23andme_20201020.txt.gz", "https://storage.googleapis.com/covid19-hg-public/20200915/results/20201020/COVID19_HGI_D1_ALL_20201020.txt.gz")  
+
+write.table(covidurls, "/Users/mk31/covid_links_oct2020.txt", row.names = F, col.names = F, quote = F)
+
+# download all the COVID datasets to my VM
+
+system('/Users/mk31/google-cloud-sdk/bin/gcloud compute scp "/Users/mk31/covid_links_oct2020.txt" "mohd-analysis-gsmr3-uk10k": --zone=europe-west1-d')
+
+```
+
+```{bash eval=FALSE}
+gcloud compute --project "open-targets-genetics" ssh --zone "europe-west1-d" "mohd-analysis-gsmr3-uk10k"
+
+mkdir covid_oct2020
+
+mv covid_links_oct2020.txt covid_oct2020
+
+cd covid_oct2020
+
+wget -i covid_links_oct2020.txt
+
+gunzip *.gz
+
+```
+
+## Add N (case + control) sample size to each COVID GWAS file
+
+```{bash eval=FALSE}
+# script to add N to each gwas file (N calculated leaving out 23andMe) - this should be made into a loop
+
+# N_A1 = 269 + 688 # Very severe respiratory confirmed covid vs. not hospitalized covid
+# N_A2 = 4336 + 623902 # very severe respiratory confirmed covid vs. population
+# N_B1 = 2430 + 8478 # hospitalized covid vs. not hospitalized covid
+# N_B2 = 7885 + 961804 # hospitalized covid vs. population
+# N_C1 = 11085 + 116794 # covid vs. lab/self-reported negative
+# N_C2 = 17965 + 1370547 # covid vs. population
+# N_D1 = 3204 + 35728 # Predicted covid from self-reported symptoms vs. predicted or self-reported non-covid
+
+cat COVID19_HGI_A1_ALL_20201020.txt  | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="957"}1' > COVID19_HGI_A1_ALL_20201020_N.txt
+
+cat COVID19_HGI_A2_ALL_leave_23andme_20201020.txt | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="628238"}1' > COVID19_HGI_A2_ALL_leave_23andme_20201020_N.txt
+
+cat COVID19_HGI_B1_ALL_20201020.txt | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="10908"}1' > COVID19_HGI_B1_ALL_20201020_N.txt
+
+cat COVID19_HGI_B2_ALL_leave_23andme_20201020.txt | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="969689"}1' > COVID19_HGI_B2_ALL_leave_23andme_20201020_N.txt
+
+cat COVID19_HGI_C1_ALL_leave_23andme_20201020.txt | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="127879"}1' > COVID19_HGI_C1_ALL_leave_23andme_20201020_N.txt
+
+cat COVID19_HGI_C2_ALL_leave_23andme_20201020.txt | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="1388512"}1' > COVID19_HGI_C2_ALL_leave_23andme_20201020_N.txt
+
+cat COVID19_HGI_D1_ALL_20201020.txt | awk 'BEGIN{OFS="\t"}NR==1{$(NF+1)="N"} NR>1{$(NF+1)="38932"}1' > COVID19_HGI_D1_ALL_20201020_N.txt
+
+```
+
+## Upload to my GB
+
+```{bash eval=FALSE}
+
+# upload to my google bucket for further processing using BQ
+
+gsutil -m cp *_N.txt gs://genetics-portal-analysis/mohd/covid3-oct2020 # IF ResumableUploadAbortException: 403 Insufficient Permission, 
+# 0. Stop VM instance
+# 1. Open VM instance details
+# 2. Press "Edit"
+# 3. Change Cloud API access scope--> "Allow full access to all cloud APIs"
+# 4. rm -r ~/.gsutil
+```
+
+## Load each table in BQ from GB manually (specifying CSV format but), specifying 'tab' as a delimiter in advanced options as these are really tab-separated files (done manually)
+
+## Use BQ to gsmr-format each COVID gwas file, remove any duplicate rows, and send them back to my GB
+
+```{r eval=FALSE}
+library(bigrquery)
+library(dplyr)
+
+project <- "open-targets-genetics" # replace this with your project ID 
+
+studies <- c("COVID19_HGI_A1_ALL_20201020_N", "COVID19_HGI_A2_ALL_leave_23andme_20201020_N", "COVID19_HGI_B1_ALL_20201020_N", "COVID19_HGI_B2_ALL_leave_23andme_20201020_N", "COVID19_HGI_C1_ALL_leave_23andme_20201020_N", "COVID19_HGI_C2_ALL_leave_23andme_20201020_N", "COVID19_HGI_D1_ALL_20201020_N")
+
+sapply(seq_along(studies), function (x) {
+  
+  # build query
+  
+  require(bigrquery)
+  
+  project <- "open-targets-genetics"
+  
+  study <- studies[x]
+  
+  print(study)
+  
+  # THIS QUERY WILL REMOVE ROWS WITH DUPLICATE SNP IDs
+  
+  qry <- paste0("WITH 
+  BIG_QUERY AS (
+WITH
+  BIG_SUB_QUERY AS (
+  SELECT
+    string_field_4 AS SNP,
+    string_field_3 AS A1,
+    string_field_2 AS A2,
+    string_field_11 AS freq,
+    string_field_6 AS b,
+    string_field_7 AS se,
+    string_field_8 AS p,
+    string_field_13 as N
+  FROM
+    `mohd_hypothesis.", study, "`", ")",
+"SELECT
+  *
+FROM (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY SNP) row_number
+  FROM
+    BIG_SUB_QUERY)
+WHERE
+  row_number = 1)
+  SELECT
+    SNP,
+    A1,
+    A2,
+    freq,
+    b,
+    se,
+    p,
+    N
+   FROM
+    BIG_QUERY
+")
+
+  # run bigquery
+  
+  tb <- bq_project_query(project, qry)
+  
+  # save in my gcloud bucket
+  
+  bq_perform_extract(tb, paste0("gs://genetics-portal-analysis/mohd/covid3-oct2020-gsmr-formatted/", study, "*.csv"), destination_format = "CSV", print_header = FALSE)
+  
+  print(paste0(study, " GSMR formatted and uploaded to GC bucket"))
+  
+})
+```
+
+## Compose files back if they are split by BQ (same as for exposure)
+## Replace comma by single space (same as for exposure)
+
+# Reference data: UKB genotypes (downsampled to 10k)
+
+These are already formatted in-house in PLINK binary format with variants annotated as chr:pos(b38):ref:alt and deposited in the Sanger farm. The following code was used to import the data from farm to my VM for gsmr analysis
+
+```{bash eval=FALSE}
+gcloud compute scp --recurse lustre/scratch115/projects/otcoregen/em21/uk_biobank_analysis/create_10k_subsample/output/ukb_v3_downsampled10k_plink mohd-analysis-gsmr3-uk10k:~/ --zone=europe-west1-d
+```
+
+# Creating path files for protein, outcome and reference files for GSMR analysis
+
+```{bash eval=FALSE}
+
+# COVID
+
+ls -d "$PWD"/covid_sep2020/covid2-sep2020-gsmr-formatted/*.csv > covid_gsmr1.txt
+ls -d "$PWD"/covid_sep2020/covid2-sep2020-gsmr-formatted/*.csv | sed 's:.*/::' | sed 's/.csv//' > covid_gsmr2.txt
+paste covid_gsmr2.txt covid_gsmr1.txt > covid_gsmr.txt
+
+# Sun 
+
+ls -d $PWD/sun_gsmr/* | sed 's:.*/::' > prot1.txt
+ls -d $PWD/sun_gsmr/* > prot2.txt
+paste prot1.txt prot2.txt > prot.txt
+
+# Reference
+
+ls -d $PWD/ukb_v3_downsampled10k_plink/* | grep -v '\.crc$' | sed 's/.bed//' | sed 's/.bim//' | sed 's/.fam//' | uniq > ukb_v3_downsampled10k_plink.txt
+```
+
+# GSMR script
+
+## download GCTA
+
+```{bash eval=FALSE}
+wget https://cnsgenomics.com/software/gcta/bin/gcta_1.93.2beta_mac.zip
+unzip gcta_1.93.2beta_mac.zip
+```
+
+## Run pan-GSMR
+
+```{bash eval=FALSE}
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+ 
+$DIR/gcta_1.93.2beta/gcta64 \
+ --mbfile $DIR/ukb_v3_downsampled10k_plink.txt \
+ --gsmr-file $DIR/prot.txt $DIR/covid_gsmr.txt \
+ --gsmr-direction 0 --clump-r2 0.05 --gwas-thresh 5e-8 --gsmr-snp-min 10 --effect-plot --out sun_outcomes_covid2_sep2020_gsmr_results
+```
+
+# Cis-MR
+
+## This requires a base file containing proteins probes (excluding X/Y chromosomes and proteins that have an ensembl ID but no chromosome number) parameters (e.g. TSS) for extraction of cis-regions from full Sun protein GWAS files (base_file_forcisMR_coloc_analysis.Rmd)
+
+## Then run make_cis_dataset_sun.R and create cis-datasets in VM
+
+## Run cis-MR
+
+```{bash eval=FALSE}
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+ 
+$DIR/gcta_1.93.2beta/gcta64 \
+ --mbfile $DIR/ukb_v3_downsampled10k_plink.txt \
+ --gsmr-file $DIR/prot.txt $DIR/covid_gsmr.txt \
+ --gsmr-direction 0 --clump-r2 0.05 --gwas-thresh 1e-5 --gsmr-snp-min 5 --effect-plot --out sun_outcomes_covid2_sep2020_gsmr_results
+```
+
+# Coloc analysis
+
+## This requires a base file containing proteins probes (excluding X/Y chromosomes and proteins that have an ensembl ID but no chromosome number) parameters (e.g. TSS) for extraction of cis-regions from full Sun protein GWAS files (base_file_forcisMR_coloc_analysis.Rmd)
+
+## Then run make_coloc_dataset_sun.R and make_coloc_dataset_covid.R in VM
+
+## Then run coloc_pqtl_covid.r in VM. This will produce a single file containing pairwise coloc data and single SNP MR analysis results between each protein probe cis-regions and each COVID outcome cis-regions

@@ -1,0 +1,121 @@
+---
+title: "create base file for cis-MR and coloc analysis"
+author: "mak"
+date: "15/03/2021"
+output: html_document
+---
+
+# Curating a Sun protein probe file that contains the parameters for extraction of cis-regions
+
+```{r}
+# create a df of chr, gene, tss, 1mb_tss
+
+library(bigrquery)
+
+project <- "open-targets-genetics" # replace this with your project ID 
+
+qry1 <- "SELECT
+  *
+FROM
+  `190505.genes`"
+
+# qry2 <- "SELECT
+#   *
+# FROM
+#   `190303.genes`"
+
+# genes <- bq_project_query(project, qry1) %>% bq_table_download()
+
+genes <- bq_project_query(project, qry1) %>% bq_table_download() %>% dplyr::select(chr, gene_id, gene_name, tss)
+
+# genes2 <- bq_project_query(project, qry2) %>% bq_table_download() %>% dplyr::select(chr, gene_id, gene_name, tss) # build 37 coordinates
+
+targets <- data.table::fread("https://storage.googleapis.com/open-targets-data-releases/20.09/output/20.09_target_list.csv.gz", stringsAsFactors = F)
+
+# retain ensemble ids from genes df that are analysed in Sun et al
+
+sun <- data.table::fread("/Users/mk31/SOMALOGIC_GWAS_protein_info.csv", stringsAsFactors = F)
+
+# system('/Users/mk31/google-cloud-sdk/bin/gcloud compute scp "/Users/mk31/SOMALOGIC_GWAS_protein_info.csv" "mohd-analysis-gsmr3-uk10k": --zone=europe-west1-d')
+
+sun$gene <- sapply(seq_along(sun$SOMAMER_ID), function (x) strsplit(sun$SOMAMER_ID[x], "\\.")[[1]][1])
+
+# sun_genes <- merge(sun, genes, by.x = "Target", by.y = "gene_name", all.x = T)
+
+pos <- match(sun$gene, targets$hgnc_approved_symbol)
+
+sun$hgnc <- targets$hgnc_approved_symbol[pos]
+
+sun$ensembl_id <- targets$ensembl_id[pos]
+
+# probing NAs in above using uniprot IDs
+
+pos_na <- which(is.na(sun$ensembl_id))
+
+pos_na_uniprot <- sapply(seq_along(sun$UniProt)[pos_na], function (x) grep(sun$UniProt[x], targets$uniprot_accessions))
+
+pos_na_uniprot2 <- as.numeric(as.character(pos_na_uniprot))
+
+sun$hgnc[pos_na] <- targets$hgnc_approved_symbol[pos_na_uniprot2]
+
+sun$ensembl_id[pos_na] <- targets$ensembl_id[pos_na_uniprot2]
+
+# there are still length(which(is.na(sun$hgnc))) = 10 sun proteins with NA labelled, these will need manual fill-up
+
+# BAGE3 > BAGE3 (not present in OT, Q86Y29)
+# C21orf33 > GATD3A
+# CDC2 <- POLD1 or CDK1? (CDC2 is an alias for both POLD1 and CDK1 in OT) > exclude, its a complex probe, picking up both CDC2:CCNB1 complexes
+# HLA > HLA_DPB1
+# KIR2DL2 > KIR2DL2 (maps to HLA-C in OT)
+# KIR2DL5A > KIR2DL5A (not present in OT, Q8N109)
+# KIR2DL5A > KIR2DL5A
+# KIR2DS2 > KIR2DS2 (not present in OT, P43631)
+# KIR3DS1 > KIR3DS1 (not present in OT, Q14943)
+# LOC652493.6561.77.3 > exclude, does not have a uniprot ID, likely a protein complex)
+
+# instead of manually filling them, will exclude them as they don't have ensemble IDs (except C21orf33 and HLA_DBP1)
+
+# GATD3A
+
+sun$hgnc[grep("C21orf33", sun$gene)] <- "GATD3A"
+sun$ensembl_id[grep("C21orf33", sun$gene)] <- "ENSG00000160221"
+
+# HLA_DPB1
+
+sun$hgnc[grep("HLA-DPB1", sun$Target)] <- "HLA-DPB1"
+sun$ensembl_id[grep("HLA-DPB1", sun$Target)] <- "ENSG00000223865"
+
+sun2 <- na.omit(sun)
+
+# include chr and TSS and define windows
+
+pos_sun2 <- match(sun2$ensembl_id, genes$gene_id)
+
+sun2$chr <- genes$chr[pos_sun2]
+
+sun2$tss <- genes$tss[pos_sun2]
+
+sun2$r1 <- sun2$tss-1000000
+
+sun2$r2 <- sun2$tss+1000000
+
+# remove proteins that are x/y-chromosome driven for now or ensemble IDs which were not mapped to a chromosome 
+
+sun3 <- sun2[-grep("X|Y", sun2$chr),]
+
+sun4 <- na.omit(sun3) # (they had ensemble IDs but no chr? > BAGE2, LPAL2, PTCHD3)
+
+# correcting the probe names
+
+sun4$sun_id <- sapply(seq_along(sun4$SOMAMER_ID), function (x) paste(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]][-c(length(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]]):(length(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]])-1))], collapse = "_"))
+
+sun4$sun_id[1074:1999] <- sapply(seq_along(sun4$SOMAMER_ID)[1074:1999], function (x) paste(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]][-c(length(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]]):(length(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]])+2))], collapse = "_"))
+
+sun4$sun_id[2000:length(sun4$sun_id)] <- sapply(seq_along(sun4$SOMAMER_ID)[2000:length(sun4$sun_id)], function (x) paste(strsplit(sun4$SOMAMER_ID[x], "\\.")[[1]], collapse = "_"))
+
+write.csv(sun4, "/Users/mk31/sun_proteins_ensid_coloc.csv", row.names = F)
+
+system('/Users/mk31/google-cloud-sdk/bin/gcloud compute scp "/Users/mk31/sun_proteins_ensid_coloc.csv" "mohd-analysis-gsmr2": --zone=europe-west1-d')
+
+sun <- data.table::fread("/Users/mk31/sun_proteins_ensid_coloc.csv", stringsAsFactors = F)
+```
