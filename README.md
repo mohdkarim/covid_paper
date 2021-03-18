@@ -1,6 +1,6 @@
 # covid_paper
  
-This repository contains codes for our protein-COVID MR and coloc analysis from Open Targets Genetics.
+This repository contains codes used for protein-COVID MR and coloc analysis from Open Targets Genetics (https://www.medrxiv.org/content/10.1101/2021.03.15.21253625v1)
 
 The GSMR_coloc_COVID_analysis_codes.Rmd contains R and shell codes that were used to format the protein (Sun et al) and COVID outcome datasets (Oct 2020, release 4) for GSMR analysis.
 
